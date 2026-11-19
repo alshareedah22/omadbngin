@@ -467,6 +467,7 @@ Panel {
     width: settingsPage.width
     height: Math.max(rowTitle.implicitHeight, holder.childrenRect.height)
     Text {
+      textFormat: Text.PlainText
       id: rowTitle
       anchors.verticalCenter: parent.verticalCenter
       text: parent.title
@@ -601,6 +602,7 @@ Panel {
           y: -height * 0.35
           color: Color.accent
           Text {
+            textFormat: Text.PlainText
             id: badgeText
             anchors.centerIn: parent
             text: String(root.runningCount)
@@ -625,6 +627,7 @@ Panel {
         }
       }
       Text {
+        textFormat: Text.PlainText
         anchors.verticalCenter: parent.verticalCenter
         visible: root.countStyle === "Text" && root.runningCount > 0
         text: String(root.runningCount)
@@ -721,6 +724,17 @@ Panel {
             font.letterSpacing: 1.2
           }
         }
+      }
+
+      Text {
+        width: parent.width
+        visible: DbState.stateError !== ""
+        textFormat: Text.PlainText
+        wrapMode: Text.Wrap
+        text: DbState.stateError
+        color: Color.urgent
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
       }
 
       Text {
@@ -972,6 +986,7 @@ Panel {
                       }
                     }
                     Text {
+                      textFormat: Text.PlainText
                       visible: root.backups.length === 0 && row.modelData.engine !== "mongodb"
                       text: "No backups of " + row.modelData.name + " in " + root.backupLabel + " yet"
                       color: Qt.darker(root.fg, 1.6)
@@ -1051,6 +1066,7 @@ Panel {
                         required property var modelData
                         spacing: Style.space(10)
                         Text {
+                          textFormat: Text.PlainText
                           width: Style.space(200)
                           elide: Text.ElideMiddle
                           text: modelData.path.split("/").pop() + "  ·  " + root.human(modelData.bytes)
@@ -1316,6 +1332,14 @@ Panel {
 
         Label {
           width: parent.width
+          visible: passField.text === ""
+          wrapMode: Text.Wrap
+          text: "No password: every account on this computer can connect to this server. Set one on shared machines."
+          color: Color.urgent
+        }
+
+        Label {
+          width: parent.width
           wrapMode: Text.Wrap
           text: {
             const e = root.newEngine
@@ -1479,6 +1503,7 @@ Panel {
             width: settingsPage.width
             height: defPort.height
             Text {
+              textFormat: Text.PlainText
               anchors.verticalCenter: parent.verticalCenter
               text: parent.modelData.title
               color: root.fg

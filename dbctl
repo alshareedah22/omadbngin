@@ -109,6 +109,17 @@ mode_of() {
   fi
 }
 
+# The servers' server.json files, into SERVER_FILES. Directories kept by `remove --keep-data`
+# (<name>.removed-<date>) hold a server.json too, but are no servers.
+list_servers() {
+  SERVER_FILES=()
+  local f
+  for f in "$SERVERS_DIR"/*/server.json; do
+    [[ -f $f && $f != *.removed-*/server.json ]] && SERVER_FILES+=("$f")
+  done
+  return 0
+}
+
 require_managed() {
   [[ -n ${1:-} ]] || fail "missing server name"
   # The same rule create uses, so a name can never point outside the servers folder.
@@ -130,8 +141,9 @@ port_taken() {
   local p=$1
   ss -ltnH "sport = :$p" 2>/dev/null | grep -q . && return 0
   # Stopped servers still own their port.
-  if compgen -G "$SERVERS_DIR/*/server.json" >/dev/null; then
-    jq -e --argjson p "$p" 'select(.port == $p)' "$SERVERS_DIR"/*/server.json >/dev/null 2>&1 && return 0
+  list_servers
+  if ((${#SERVER_FILES[@]})); then
+    jq -e --argjson p "$p" 'select(.port == $p)' "${SERVER_FILES[@]}" >/dev/null 2>&1 && return 0
   fi
   if [[ $(docker_status) == running ]]; then
     docker ps -a --filter "label=$LABEL" --filter "label=omadbngin.port=$p" -q | grep -q . && return 0
@@ -186,8 +198,12 @@ mysql_setup_sql() {
 mysql_apply() {
   local sql=$1 i
   shift
+  # APPLY_PID (set by provision_mysql): the server being set up. Stop waiting when it is gone.
   for i in $(seq 1 120); do
     "$@" -e "SELECT 1" >/dev/null 2>&1 && break
+    if [[ -n ${APPLY_PID:-} ]] && ! kill -0 "$APPLY_PID" 2>/dev/null; then
+      fail "the database server exited during setup: $(tail -1 "${APPLY_LOG:-/dev/null}" 2>/dev/null)"
+    fi
     sleep 1
   done
   local out
@@ -298,10 +314,13 @@ ensure_engine() {
     rm -rf "$src"
     mkdir -p "$src"
     tar -xzf "$archive" -C "$src" --strip-components=1
+    command -v make >/dev/null && command -v gcc >/dev/null || fail "building $engine $v needs make and gcc (sudo pacman -S base-devel)"
     echo "Building $(engine_field "$engine" title) $v…" >&2
     # Only the server and CLI: Redis 8's full build also wants cmake for optional modules.
-    make -C "$src/src" -j"$(nproc)" BUILD_TLS=no MALLOC=libc "$engine-server" "$engine-cli" >/dev/null 2>&1 ||
-      fail "building $engine $v failed"
+    local buildlog="$HOME_DIR/tmp/$engine-$v-build.log"
+    make -C "$src/src" -j"$(nproc)" BUILD_TLS=no MALLOC=libc "$engine-server" "$engine-cli" >"$buildlog" 2>&1 ||
+      fail "building $engine $v failed; the build log is $buildlog"
+    rm -f "$buildlog"
     mkdir -p "$work/bin"
     cp "$src"/src/"$engine"-server "$src"/src/"$engine"-cli "$work/bin/"
     rm -rf "$src"
@@ -367,7 +386,7 @@ add_compat() {
 with_compat() {
   local base=$1
   shift
-  if [[ -d $base/compat ]]; then echo "env LD_LIBRARY_PATH=$base/compat $*"; else echo "$*"; fi
+  if [[ -d $base/compat ]]; then echo "env $(ux "LD_LIBRARY_PATH=$base/compat") $*"; else echo "$*"; fi
 }
 
 # MongoDB server builds no longer ship a shell; add mongosh next to mongod.
@@ -380,16 +399,38 @@ ensure_mongosh() {
 
 # ---- Native servers ---------------------------------------------------------
 
-# The command line that runs a native server in the foreground.
+# One word of a systemd command line: double-quoted, with \ " % $ escaped (systemd expands
+# %specifiers and $VARIABLES in ExecStart, and splits it at spaces).
+ux() {
+  local w=$1
+  w=${w//\\/\\\\}
+  w=${w//\"/\\\"}
+  w=${w//%/%%}
+  w=${w//\$/\$\$}
+  printf '"%s"' "$w"
+}
+
+# Where a native server keeps its sockets: its own run directory, unless that makes the socket
+# path too long (the limit is 107 bytes, and ".s.PGSQL.<port>" is added): then a short one
+# under $XDG_RUNTIME_DIR that systemd creates for the unit (RuntimeDirectory=).
+run_dir() {
+  local dir=$1 name
+  if ((${#dir} + 4 + 20 <= 100)); then echo "$dir/run"; return; fi
+  name=${dir##*/}
+  echo "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$PREFIX$name"
+}
+
+# The command line that runs a native server in the foreground, every path quoted for systemd.
 native_exec() {
   local engine=$1 base=$2 dir=$3 port=$4
-  local data="$dir/data" run="$dir/run"
+  local data="$dir/data" run
+  run=$(run_dir "$dir")
   case $engine in
-  postgresql) echo "$base/bin/postgres -D $data -p $port -c listen_addresses=127.0.0.1 -c unix_socket_directories=$run" ;;
-  mysql) echo "$base/bin/mysqld --no-defaults --basedir=$base --datadir=$data --port=$port --bind-address=127.0.0.1 --socket=$run/mysqld.sock --pid-file=$run/mysqld.pid --mysqlx=OFF" ;;
-  mariadb) echo "$base/bin/mariadbd --no-defaults --basedir=$base --datadir=$data --port=$port --bind-address=127.0.0.1 --socket=$run/mysqld.sock --pid-file=$run/mysqld.pid" ;;
-  redis | valkey) echo "$base/bin/$engine-server $dir/$engine.conf" ;;
-  mongodb) echo "$base/bin/mongod --dbpath $data --port $port --bind_ip 127.0.0.1${5:+ --auth}" ;;
+  postgresql) echo "$(ux "$base/bin/postgres") -D $(ux "$data") -p $port -c listen_addresses=127.0.0.1 -c $(ux "unix_socket_directories=$run")" ;;
+  mysql) echo "$(ux "$base/bin/mysqld") --no-defaults $(ux "--basedir=$base") $(ux "--datadir=$data") --port=$port --bind-address=127.0.0.1 $(ux "--socket=$run/mysqld.sock") $(ux "--pid-file=$run/mysqld.pid") --mysqlx=OFF" ;;
+  mariadb) echo "$(ux "$base/bin/mariadbd") --no-defaults $(ux "--basedir=$base") $(ux "--datadir=$data") --port=$port --bind-address=127.0.0.1 $(ux "--socket=$run/mysqld.sock") $(ux "--pid-file=$run/mysqld.pid")" ;;
+  redis | valkey) echo "$(ux "$base/bin/$engine-server") $(ux "$dir/$engine.conf")" ;;
+  mongodb) echo "$(ux "$base/bin/mongod") --dbpath $(ux "$data") --port $port --bind_ip 127.0.0.1${5:+ --auth}" ;;
   esac
 }
 
@@ -421,6 +462,10 @@ write_unit() {
   local name=$1 engine=$2 exact=$3 cmd=$4 kill=SIGTERM
   [[ $engine == postgresql ]] && kill=SIGINT # fast shutdown, no waiting on clients
   mkdir -p "$UNIT_DIR"
+  # a short socket directory, when the server's own would be too long (see run_dir)
+  local rundir=""
+  [[ $(run_dir "$(server_dir "$name")") == "$(server_dir "$name")/run" ]] ||
+    rundir=$'RuntimeDirectory='"$PREFIX$name"$'\nRuntimeDirectoryMode=0700'
   cat >"$UNIT_DIR/$(unit "$name")" <<EOF
 # Managed by OmaDBngin (blackcode.omadbngin). Edit the server in the panel, not here.
 [Unit]
@@ -429,6 +474,7 @@ Description=OmaDBngin $name ($(engine_field "$engine" title) $exact)
 [Service]
 Type=simple
 ExecStart=$cmd
+${rundir}
 KillSignal=$kill
 TimeoutStopSec=60
 Restart=on-failure
@@ -449,9 +495,13 @@ provision_mysql() {
   "$base/bin/$daemon" --no-defaults --basedir="$base" --datadir="$dir/data" --skip-networking \
     --socket="$tmp/s" --pid-file="$tmp/pid" "${extra[@]}" >"$tmp/log" 2>&1 &
   pid=$!
-  mysql_apply "$(mysql_setup_sql "$user" "$pass")" "$base/bin/$client" --socket="$tmp/s" -uroot
+  # however this ends (a failed setup calls fail), the background server and the scratch dir go
+  # shellcheck disable=SC2064
+  trap "kill $pid 2>/dev/null; wait $pid 2>/dev/null; rm -rf $(printf '%q' "$tmp")" EXIT
+  APPLY_PID=$pid APPLY_LOG=$tmp/log mysql_apply "$(mysql_setup_sql "$user" "$pass")" "$base/bin/$client" --socket="$tmp/s" -uroot
   MYSQL_PWD=$pass "$base/bin/$client" --socket="$tmp/s" -uroot -e SHUTDOWN >/dev/null 2>&1 || kill "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
+  wait "$pid" 2>/dev/null || true
+  trap - EXIT
   rm -rf "$tmp"
 }
 
@@ -506,7 +556,7 @@ create_native() {
   fi
   if [[ $engine == redis || $engine == valkey ]]; then
     {
-      printf 'port %s\nbind 127.0.0.1\ndir %s\nappendonly yes\ndaemonize no\nprotected-mode no\n' "$port" "$dir/data"
+      printf 'port %s\nbind 127.0.0.1\ndir "%s"\nappendonly yes\ndaemonize no\nprotected-mode no\n' "$port" "$dir/data"
       redis_auth_conf "$user" "$pass"
     } >"$dir/$engine.conf"
     chmod 600 "$dir/$engine.conf"
@@ -703,7 +753,7 @@ LEGACY_PREFIX="omadb-"
 migrate_native() {
   local s dir name engine exact port user base auth=() running=() enabled=()
   for s in "$LEGACY_HOME"/servers/*/server.json; do
-    [[ -f $s ]] || continue
+    [[ -f $s && $s != *.removed-*/server.json ]] || continue
     name=$(jq -r .name "$s")
     systemctl --user is-active --quiet "$LEGACY_PREFIX$name.service" && running+=("$name")
     systemctl --user is-enabled --quiet "$LEGACY_PREFIX$name.service" 2>/dev/null && enabled+=("$name")
@@ -711,9 +761,18 @@ migrate_native() {
     rm -f "$UNIT_DIR/$LEGACY_PREFIX$name.service"
   done
   systemctl --user daemon-reload 2>/dev/null || true
-  mv "$LEGACY_HOME" "$HOME_DIR"
+  if [[ -e $HOME_DIR ]]; then
+    # `setup` may have created the directory already: move the old entries in, never over new ones
+    local e
+    for e in "$LEGACY_HOME"/* "$LEGACY_HOME"/.[!.]*; do
+      [[ -e $e && ! -e $HOME_DIR/${e##*/} ]] && mv "$e" "$HOME_DIR/"
+    done
+    rmdir "$LEGACY_HOME" 2>/dev/null || true # anything left was never ours to delete
+  else
+    mv "$LEGACY_HOME" "$HOME_DIR"
+  fi
   for s in "$SERVERS_DIR"/*/server.json; do
-    [[ -f $s ]] || continue
+    [[ -f $s && $s != *.removed-*/server.json ]] || continue
     dir=${s%/server.json}
     name=$(jq -r .name "$s")
     engine=$(jq -r .engine "$s")
@@ -729,6 +788,7 @@ migrate_native() {
     [[ " ${enabled[*]} " == *" $name "* ]] && systemctl --user enable --quiet "$(unit "$name")"
     [[ " ${running[*]} " == *" $name "* ]] && systemctl --user start "$(unit "$name")"
   done
+  return 0
 }
 
 migrate_docker() {
@@ -769,13 +829,22 @@ migrate_docker() {
     # The settings dbctl passed at creation (the image's own variables come back by themselves).
     while IFS= read -r e; do [[ -n $e ]] && env+=(-e "$e"); done < <(
       docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' "$old" | grep -E '^(POSTGRES|MYSQL|MARIADB|MONGO_INITDB)_')
-    docker rm "$old" >/dev/null
-    if [[ $engine == redis || $engine == valkey ]]; then
-      redis_volume_conf "$name" "$image" "$user" "$pass"
-      cmd=("$engine-server" /data/omadbngin.conf --appendonly yes)
+    # The old container (it holds the password) stays, stopped, until the new one exists.
+    if ! (
+      if [[ $engine == redis || $engine == valkey ]]; then
+        redis_volume_conf "$name" "$image" "$user" "$pass" || exit 1
+        cmd=("$engine-server" /data/omadbngin.conf --appendonly yes)
+      fi
+      docker_run "$name" "$engine" "$version" "$port" "$autostart" "$user" "$pass" "$image" "$inner" "$data" "${#env[@]}" \
+        "${env[@]}" "${cmd[@]}"
+    ); then
+      docker rm -f "$(container "$name")" >/dev/null 2>&1 || true
+      docker volume rm "$(container "$name")" >/dev/null 2>&1 || true
+      [[ $running == true ]] && docker start "$old" >/dev/null
+      echo "dbctl: left $old as it was: creating the new container failed" >&2
+      continue
     fi
-    docker_run "$name" "$engine" "$version" "$port" "$autostart" "$user" "$pass" "$image" "$inner" "$data" "${#env[@]}" \
-      "${env[@]}" "${cmd[@]}"
+    docker rm "$old" >/dev/null
     [[ $running == true ]] || docker stop "$(container "$name")" >/dev/null
     echo "dbctl: $name now uses volume $(container "$name"); the old volume $old can be removed with: docker volume rm $old" >&2
   done
@@ -785,13 +854,23 @@ migrate_docker() {
 }
 
 migrate_legacy() {
-  # Only for the default locations (tests set both), and only once: the new directory existing means done.
+  # Only for the default locations (tests set both).
   [[ -z ${OMADBNGIN_HOME:-} || -n ${OMADBNGIN_LEGACY_HOME:-} ]] || return 0
-  if [[ ! -e $HOME_DIR && -d $LEGACY_HOME ]]; then
-    echo "Moving OmaDB servers to OmaDBngin…" >&2
-    migrate_native
+  # Done means the marker exists. (The directory alone proves nothing: `setup` creates it, and
+  # `setup` and `state` run side by side on the first start.)
+  local marker="$HOME_DIR/.migrated"
+  [[ -e $marker ]] && { migrate_docker; return 0; }
+  exec 8>"${XDG_RUNTIME_DIR:-/tmp}/omadbngin-migrate-$(id -u).lock"
+  flock 8
+  if [[ ! -e $marker ]]; then
+    if [[ -d $LEGACY_HOME ]]; then
+      echo "Moving OmaDB servers to OmaDBngin…" >&2
+      migrate_native
+    fi
+    mkdir -p "$HOME_DIR" && : >"$marker"
   fi
   migrate_docker
+  flock -u 8
 }
 
 # ---- Commands ---------------------------------------------------------------
@@ -836,13 +915,12 @@ cmd_sizes() {
   local cache="$HOME_DIR/.sizes.json"
   if [[ -f $cache && $(($(date +%s) - $(stat -c %Y "$cache"))) -lt 300 ]]; then cat "$cache"; return; fi
   local out="{}" f name size mp
-  if compgen -G "$SERVERS_DIR/*/server.json" >/dev/null; then
-    for f in "$SERVERS_DIR"/*/server.json; do
-      name=$(basename "$(dirname "$f")")
-      size=$(du -sb "$(dirname "$f")/data" 2>/dev/null | cut -f1)
-      out=$(jq -c --arg n "$name" --argjson s "${size:-null}" '. + {($n): $s}' <<<"$out")
-    done
-  fi
+  list_servers
+  for f in "${SERVER_FILES[@]}"; do
+    name=$(basename "$(dirname "$f")")
+    size=$(du -sb "$(dirname "$f")/data" 2>/dev/null | cut -f1)
+    out=$(jq -c --arg n "$name" --argjson s "${size:-null}" '. + {($n): $s}' <<<"$out")
+  done
   if [[ $(docker_status) == running ]]; then
     while read -r name; do
       [[ -n $name ]] || continue
@@ -979,22 +1057,26 @@ BIND_MARK="-- OmaDBngin panel (dbctl unbind removes these two lines)"
 BIND_LINE="o.bind(\"$BIND_KEYS\", \"OmaDBngin\", \"qs -p /usr/share/omarchy/shell ipc call blackcode.omadbngin toggle\")"
 
 cmd_bind() {
-  local file=${OMADBNGIN_BINDINGS:-$BINDINGS} text
+  local file=${OMADBNGIN_BINDINGS:-$BINDINGS} text real
   [[ -f $file ]] || fail "no $file"
+  real=$file
+  file=$(readlink -f "$file") # write through a symlink instead of replacing it
   text=$(<"$file")
   if grep -qxF "$BIND_LINE" "$file"; then echo "already bound: SUPER+ALT+D opens OmaDBngin"; return; fi
   grep -qF "\"$BIND_KEYS\"" "$file" && fail "$BIND_KEYS is already bound in $file; nothing was changed"
   { [[ -z $text ]] || printf '%s\n' "$text"; printf '%s\n%s\n' "$BIND_MARK" "$BIND_LINE"; } >"$file.tmp-$$" && mv "$file.tmp-$$" "$file"
-  [[ $file == "$BINDINGS" ]] && { hyprctl reload >/dev/null 2>&1 || true; }
+  [[ $real == "$BINDINGS" ]] && { hyprctl reload >/dev/null 2>&1 || true; }
   echo "bound: SUPER+ALT+D opens OmaDBngin ('dbctl unbind' removes it)"
 }
 
 cmd_unbind() {
-  local file=${OMADBNGIN_BINDINGS:-$BINDINGS}
+  local file=${OMADBNGIN_BINDINGS:-$BINDINGS} real
   [[ -f $file ]] && grep -qxF "$BIND_LINE" "$file" || { echo "not bound; nothing to remove"; return; }
+  real=$file
+  file=$(readlink -f "$file")
   grep -vxF -e "$BIND_MARK" -e "$BIND_LINE" "$file" >"$file.tmp-$$" || true
   mv "$file.tmp-$$" "$file"
-  [[ $file == "$BINDINGS" ]] && { hyprctl reload >/dev/null 2>&1 || true; }
+  [[ $real == "$BINDINGS" ]] && { hyprctl reload >/dev/null 2>&1 || true; }
   echo "unbound SUPER+ALT+D"
 }
 
@@ -1089,19 +1171,20 @@ cmd_state() {
     fi
   fi
 
-  if compgen -G "$SERVERS_DIR/*/server.json" >/dev/null; then
+  list_servers
+  if ((${#SERVER_FILES[@]})); then
     # one systemctl call for every server's state, autostart, memory and start time
     local -A props=()
     local f n="" key value
     local -a units=()
-    for f in "$SERVERS_DIR"/*/server.json; do units+=("$(unit "$(basename "$(dirname "$f")")")"); done
+    for f in "${SERVER_FILES[@]}"; do units+=("$(unit "$(basename "$(dirname "$f")")")"); done
     while IFS='=' read -r key value; do
       case $key in
       Id) n=$value ;;
       ActiveState | UnitFileState | MemoryCurrent | ActiveEnterTimestamp | ControlGroup) props[$n.$key]=$value ;;
       esac
     done < <(systemctl --user show -p Id,ActiveState,UnitFileState,MemoryCurrent,ActiveEnterTimestamp,ControlGroup "${units[@]}" 2>/dev/null)
-    native_services=$(for f in "$SERVERS_DIR"/*/server.json; do
+    native_services=$(for f in "${SERVER_FILES[@]}"; do
       local name active enabled state mem since u
       name=$(basename "$(dirname "$f")")
       u=$(unit "$name")
@@ -1124,7 +1207,7 @@ cmd_state() {
       jq -c --arg state "$state" --arg enabled "$enabled" --argjson mem "$mem" --argjson since "${since:-0}" \
         --arg err "$err" --arg cg "${props[$u.ControlGroup]:-}" \
         '. + {state: $state, health: "", running: ($state == "running"), autostart: ($enabled == "enabled"),
-              memory: $mem, since: $since, error: $err, exitCode: 0, oom: false, cgroup: $cg}' "$f"
+              memory: $mem, since: $since, error: $err, exitCode: 0, oom: false, cgroup: $cg}' "$f" || true
     done | jq -sc .)
   fi
 
@@ -1263,6 +1346,12 @@ cmd_client() {
   url=$(cmd_url "$1")
   # The terminal runs a launcher script in a private directory that deletes itself on start:
   # the password is exported there, never part of a command line.
+  # (the server first: if that fails there is no launcher script to leave behind)
+  if [[ $MODE == native ]]; then
+    systemctl --user is-active --quiet "$(unit "$1")" || systemctl --user start "$(unit "$1")"
+  else
+    [[ $(docker inspect -f '{{.State.Running}}' "$(container "$1")") == true ]] || docker start "$(container "$1")" >/dev/null
+  fi
   local dir script
   dir="$HOME_DIR/run"
   mkdir -p "$dir"
@@ -1299,12 +1388,12 @@ cmd_client() {
       esac
     fi
   } >"$script"
-  if [[ $MODE == native ]]; then
-    systemctl --user is-active --quiet "$(unit "$1")" || systemctl --user start "$(unit "$1")"
-  else
-    [[ $(docker inspect -f '{{.State.Running}}' "$(container "$1")") == true ]] || docker start "$(container "$1")" >/dev/null
+  # the script holds the password and deletes itself when the terminal runs it: if there is no
+  # terminal, remove it here
+  if ! omarchy launch tui --app-id="omadbngin-$1" bash "$script"; then
+    rm -f "$script"
+    fail "could not open a terminal for the client"
   fi
-  omarchy launch tui --app-id="omadbngin-$1" bash "$script"
 }
 
 cmd_logs() {
@@ -1360,6 +1449,22 @@ cmd_backup() {
   chmod 600 "$tmp" # docker cp keeps the mode from inside the container
   mv "$tmp" "$file"
   echo "$file"
+}
+
+# restore_psql <file> <psql command…>: feed a dump to psql. A pg_dumpall dump starts with
+# CREATE ROLE postgres and the like, which "already exist" on any server, so ON_ERROR_STOP
+# would stop at line 1: psql runs on, and every other error is collected and fails the restore
+# (psql itself exits 0 whatever failed in the script).
+restore_psql() {
+  local file=$1 err rc=0 real
+  shift
+  err=$("$@" <"$file" 2>&1 >/dev/null) || rc=$?
+  real=$(grep -E 'ERROR:|FATAL:|psql: error|could not connect' <<<"$err" | grep -v 'already exists' || true)
+  if [[ -n $real ]]; then
+    head -5 <<<"$real" >&2
+    return 1
+  fi
+  return "$rc"
 }
 
 # restore <name> <file>: SQL runs against the server; an RDB replaces the Redis/Valkey data
@@ -1424,13 +1529,13 @@ cmd_restore() {
     # MySQL's clients need the engine's compat libraries (libncurses) too
     if [[ -d $base/compat ]]; then export LD_LIBRARY_PATH=$base/compat; fi
     case $engine in
-    postgresql) PGPASSWORD="$PASS_" "$base/bin/psql" -X -q -h 127.0.0.1 -p "$port" -U "$USER_" -d postgres -f "$file" 2>&1 >/dev/null | grep -v 'already exists' >&2; return "${PIPESTATUS[0]}" ;;
+    postgresql) PGPASSWORD="$PASS_" restore_psql "$file" "$base/bin/psql" -X -q -h 127.0.0.1 -p "$port" -U "$USER_" -d postgres ;;
     mysql) MYSQL_PWD="$PASS_" "$base/bin/mysql" -h127.0.0.1 -P"$port" -u"$USER_" <"$file" ;;
     mariadb) MYSQL_PWD="$PASS_" "$base/bin/mariadb" -h127.0.0.1 -P"$port" -u"$USER_" --skip-ssl <"$file" ;;
     esac
   else
     case $engine in
-    postgresql) PGPASSWORD=$PASS_ docker exec -i -e PGPASSWORD "$c" psql -X -q -U "$USER_" -d postgres <"$file" 2>&1 >/dev/null | grep -v 'already exists' >&2; return "${PIPESTATUS[0]}" ;;
+    postgresql) PGPASSWORD=$PASS_ restore_psql "$file" docker exec -i -e PGPASSWORD "$c" psql -X -q -U "$USER_" -d postgres ;;
     mysql | mariadb) MYSQL_PWD=$PASS_ docker exec -i -e MYSQL_PWD "$c" "$engine" -u"$USER_" <"$file" ;;
     esac
   fi || fail "restore into $name failed"
@@ -1440,7 +1545,7 @@ cmd_restore() {
 cmd_backups() {
   local name=${1:-}
   [[ -n $name ]] || fail "missing server name"
-  find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "$name-*.sql" -o -name "$name-*.rdb" \) -printf '%T@\t%s\t%p\n' 2>/dev/null |
+  find "$BACKUP_DIR" -maxdepth 1 -type f \( -name "$name-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].sql" -o -name "$name-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].rdb" \) -printf '%T@\t%s\t%p\n' 2>/dev/null |
     sort -rn | head -20 | jq -Rsc 'split("\n") | map(select(length > 0) | split("\t") | {path: .[2], bytes: (.[1] | tonumber), time: (.[0] | tonumber | floor)})'
 }
 
@@ -1490,13 +1595,26 @@ docker_recreate() {
   [[ $(jq -r '.[0].HostConfig.RestartPolicy.Name' <<<"$info") == unless-stopped ]] && auto=on
   user=$(field_of "$name" user)
   pass=$(field_of "$name" password)
-  docker rm -f "$c" >/dev/null
-  if [[ $engine == redis || $engine == valkey ]]; then
-    redis_volume_conf "$name" "$image" "$user" "$pass"
-    cmd=("$engine-server" /data/omadbngin.conf --appendonly yes)
+  # The password lives only in the old container's label: keep that container (stopped, under
+  # another name) until the new one exists, and put it back if making the new one fails.
+  docker inspect "$c.old" >/dev/null 2>&1 && fail "$c.old is left over from an earlier change: remove it or rename it back first"
+  docker stop "$c" >/dev/null
+  docker rename "$c" "$c.old" || { [[ $running == true ]] && docker start "$c" >/dev/null; fail "could not rename $c"; }
+  if ! (
+    if [[ $engine == redis || $engine == valkey ]]; then
+      redis_volume_conf "$name" "$image" "$user" "$pass" || exit 1
+      cmd=("$engine-server" /data/omadbngin.conf --appendonly yes)
+    fi
+    docker_run "$name" "$engine" "$(field_of_label_version "$info")" "$new" "$auto" "$user" "$pass" "$image" "$inner" "$data" "${#env[@]}" "${env[@]}" "${cmd[@]}"
+  ); then
+    docker rm -f "$c" >/dev/null 2>&1 || true
+    docker rename "$c.old" "$c"
+    [[ $running == true ]] && docker start "$c" >/dev/null
+    fail "could not make $c again; it is as it was"
   fi
-  docker_run "$name" "$engine" "$(field_of_label_version "$info")" "$new" "$auto" "$user" "$pass" "$image" "$inner" "$data" "${#env[@]}" "${env[@]}" "${cmd[@]}"
+  docker rm -f "$c.old" >/dev/null
   [[ $running == true ]] || docker stop "$c" >/dev/null
+  return 0
 }
 
 # Redis/Valkey containers made before 1.5.1 have their password in the container command line,

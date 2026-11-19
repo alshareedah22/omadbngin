@@ -2,6 +2,28 @@
 
 ![OmaDBngin: local database servers, one click away in the Omarchy bar](preview.png)
 
+**Compatibility:** works with Omarchy 4.5 (checked on 4.5.0-3: manifest validation, the plugin's own tests, and every Omarchy component, command and bar interface it uses).
+
+## What's new in 1.7.1
+
+Compatibility: works with Omarchy 4.5 (checked on 4.5.0-3).
+
+- **Security notes**: a new Security section, and the create form warns when the password is empty.
+- **Safer MySQL/MariaDB setup**: the temporary setup server is always stopped and cleaned up, and
+  setup no longer waits two minutes for a server that already died.
+- **`--keep-data` leftovers** (`<name>.removed-<date>`) no longer show up as a phantom server or
+  keep their port reserved.
+- **First start after the OmaDB rename** is safe when `setup` and `state` run at the same time
+  (locked, and tracked by a `.migrated` marker).
+- **`backups`** lists only the exact server's backups (`app` no longer lists `app-staging`).
+- **Restores** into PostgreSQL fail (and say why) when SQL errors other than "already exists" occur.
+- **Docker port changes and OmaDB moves** keep the old container until the new one exists, and put it back on failure.
+- **The client launcher** (it holds the password) is deleted if the terminal cannot be opened.
+- **Paths with spaces or `%`** work in the systemd units, and long data paths get a short socket directory.
+- **`bind` / `unbind`** write through a symlinked `bindings.lua` instead of replacing it.
+- **One broken `server.json`** no longer blanks the panel; the panel shows an error if the state cannot be read.
+- **Redis builds** keep their log (`~/.local/share/omadbngin/tmp/redis-<version>-build.log`) when they fail.
+
 ## What's new in 1.7.0
 
 - **Bar icon status**: the running count as a badge (or text, or hidden), a red dot when a
@@ -151,10 +173,20 @@ argument.
 
 Servers listen on `127.0.0.1` only.
 
+## Security
+
+Servers created without a password are open to **every local account on this machine**: they
+listen on `127.0.0.1`, and anyone who can log in (or any program running as another user) can
+connect. For PostgreSQL that is worse than data access: a superuser can run `COPY ... TO PROGRAM`,
+which executes commands **as you**. Set a password in the panel (or in `OMADBNGIN_PASSWORD`)
+on any shared machine, or when other people or untrusted software run on it.
+
 ## Requirements
 
+- x86_64 Linux only (`engines.lock` pins x86_64 builds and images)
 - Omarchy 4 (the Quickshell-based `omarchy-shell` bar)
-- `curl`, `jq`, `ss`, `wl-copy`, `make` and `gcc`, which ship with Omarchy
+- `curl`, `jq`, `ss`, `wl-copy`, `make` and `gcc`, which ship with Omarchy (Redis publishes no Linux binaries, so
+  Redis is built from source on first use and needs both; if the build fails, its log path is printed)
 - For Docker mode only: Docker, running, with your user in the `docker` group
   (`omarchy install docker`)
 

@@ -18,6 +18,8 @@ Singleton {
 
   // The last `dbctl state`, parsed; null until the first one arrives.
   property var snapshot: null
+  // Why the last state read failed (empty when it worked); the panel shows it.
+  property string stateError: ""
   readonly property bool dockerUp: snapshot ? snapshot.docker === "running" : false
 
   // Stats (CPU, memory, readiness) are asked for only while a panel is open and stats are on.
@@ -127,7 +129,8 @@ Singleton {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        try { db.takeSnapshot(JSON.parse(text)) } catch (e) {}
+        try { db.takeSnapshot(JSON.parse(text)); db.stateError = "" }
+        catch (e) { db.stateError = "Could not read the server list (" + e.message + "). Run: " + db.ctl + " state" }
       }
     }
   }

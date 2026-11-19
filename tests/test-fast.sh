@@ -164,6 +164,86 @@ has "still binds" "$out" "bound: SUPER+ALT+D"
 if [[ -e $H/omadbngin/.setup-done ]]; then ok "and marks it done"; else bad "and marks it done"; fi
 printf '#!/bin/bash\nexit 0\n' >"$T/bin/hyprctl"
 
+echo "Kept data of a removed server (--keep-data)"
+mkdir -p "$OMADBNGIN_HOME/servers/gone.removed-20261029-100000/data"
+jq '.name = "gone" | .port = 5999' "$OMADBNGIN_HOME/servers/pg/server.json" >"$OMADBNGIN_HOME/servers/gone.removed-20261029-100000/server.json"
+eq "not listed as a server" "$("$DBCTL" state | jq -c '[.services[].name] | map(select(startswith("gone")))')" "[]"
+eq "its port is free again" "$("$DBCTL" port postgresql 5999)" "5999"
+eq "no size entry" "$(rm -f "$OMADBNGIN_HOME/.sizes.json"; "$DBCTL" sizes | jq -r 'keys | map(select(startswith("gone"))) | length')" "0"
+rm -rf "$OMADBNGIN_HOME/servers/gone.removed-20261029-100000"
+
+echo "A broken server.json"
+mkdir -p "$OMADBNGIN_HOME/servers/bad"
+printf '{oops' >"$OMADBNGIN_HOME/servers/bad/server.json"
+out=$("$DBCTL" state 2>/dev/null); rc=$?
+eq "state still succeeds" "$rc" "0"
+eq "the others are listed" "$(jq -r '[.services[].name] | (index("pg") != null and index("my") != null and index("bad") == null)' <<<"$out")" "true"
+rm -rf "$OMADBNGIN_HOME/servers/bad"
+
+echo "Backups of similar names"
+touch "$OMADBNGIN_BACKUP_DIR/app-20261029-100000.sql" "$OMADBNGIN_BACKUP_DIR/app-staging-20261029-100000.sql" \
+  "$OMADBNGIN_BACKUP_DIR/app-20261029-100000.rdb" "$OMADBNGIN_BACKUP_DIR/app-notes.sql"
+eq "only the exact name and timestamp" "$("$DBCTL" backups app | jq -c '[.[].path | sub(".*/"; "")] | sort')" '["app-20261029-100000.rdb","app-20261029-100000.sql"]'
+eq "the other server's own backups" "$("$DBCTL" backups app-staging | jq -c '[.[].path | sub(".*/"; "")]')" '["app-staging-20261029-100000.sql"]'
+
+echo "Shortcut file that is a symlink"
+printf -- '-- real\n' >"$T/real-bindings.lua"
+ln -s real-bindings.lua "$T/link-bindings.lua"
+OMADBNGIN_BINDINGS="$T/link-bindings.lua" "$DBCTL" bind >/dev/null
+if [[ -L $T/link-bindings.lua ]]; then ok "bind keeps the symlink"; else bad "bind replaced the symlink"; fi
+has "and writes through it" "$(cat "$T/real-bindings.lua")" 'o.bind("SUPER + ALT + D", "OmaDBngin"'
+OMADBNGIN_BINDINGS="$T/link-bindings.lua" "$DBCTL" unbind >/dev/null
+if [[ -L $T/link-bindings.lua ]]; then ok "unbind keeps the symlink"; else bad "unbind replaced the symlink"; fi
+eq "unbind restores the target" "$(cat "$T/real-bindings.lua")" "-- real"
+
+echo "Moving from OmaDB (setup runs first)"
+M="$T/mig"; mkdir -p "$M/h" "$M/xdg" "$M/new" "$M/legacy/servers/old/data"
+redis_v=$(jq -r '.engines.redis["7"].version' "$here/engines.lock")
+jq -n --arg e "$redis_v" '{name: "old", engine: "redis", version: "7", exact: $e, port: 6401, user: "default", password: "", mode: "native", created: "2026-10-01T10:00:00Z"}' \
+  >"$M/legacy/servers/old/server.json"
+: >"$M/new/.setup-done" # what `dbctl setup` leaves behind before the first `state`
+out=$(HOME="$M/h" XDG_RUNTIME_DIR="$M/xdg" OMADBNGIN_HOME="$M/new" OMADBNGIN_LEGACY_HOME="$M/legacy" "$DBCTL" state 2>/dev/null)
+eq "the old server arrives although the directory existed" "$(jq -r '.services[0].name' <<<"$out" 2>/dev/null)" "old"
+if [[ ! -e $M/legacy ]]; then ok "the legacy directory is gone"; else bad "the legacy directory is still there"; fi
+if [[ -e $M/new/.migrated && -e $M/new/.setup-done ]]; then ok "marker written, setup's marker kept"; else bad "markers"; fi
+has "its unit was written" "$(cat "$M/h/.config/systemd/user/omadbngin-old.service" 2>&1)" "redis-server"
+mkdir -p "$M/legacy/servers/again"
+HOME="$M/h" XDG_RUNTIME_DIR="$M/xdg" OMADBNGIN_HOME="$M/new" OMADBNGIN_LEGACY_HOME="$M/legacy" "$DBCTL" state >/dev/null 2>&1
+if [[ -d $M/legacy/servers/again ]]; then ok "once migrated, later runs leave a new legacy folder alone"; else bad "migrated twice"; fi
+mkdir -p "$M/new2"
+HOME="$M/h" XDG_RUNTIME_DIR="$M/xdg" OMADBNGIN_HOME="$M/new2" OMADBNGIN_LEGACY_HOME="$M/none" "$DBCTL" state >/dev/null 2>&1
+if [[ -e $M/new2/.migrated ]]; then ok "nothing to move: the marker is written anyway"; else bad "no marker without legacy data"; fi
+
+echo "Paths with spaces, long paths"
+mkdir -p "$T/ssbin"
+cat >"$T/ssbin/ss" <<'EOF'
+#!/bin/bash
+# "listening" once a unit exists (create waits for the port)
+compgen -G "$HOME/.config/systemd/user/omadbngin-*.service" >/dev/null && echo LISTEN
+exit 0
+EOF
+chmod +x "$T/ssbin/ss"
+S="$T/h sp"
+mkdir -p "$S/omadbngin/engines/redis/$redis_v/bin"
+HOME="$S" XDG_RUNTIME_DIR="$T/xdg" OMADBNGIN_HOME="$S/omadbngin" PATH="$T/ssbin:$PATH" "$DBCTL" create redis 7 spc 6390 off native >/dev/null 2>&1
+unitf="$S/.config/systemd/user/omadbngin-spc.service"
+line=$(grep '^ExecStart=' "$unitf" 2>/dev/null)
+eq "ExecStart words survive a space in HOME" "$(bash -c "set -- ${line#ExecStart=}; printf '%s|' \"\$@\"" 2>&1)" \
+  "$S/omadbngin/engines/redis/$redis_v/bin/redis-server|$S/omadbngin/servers/spc/redis.conf|"
+has "the redis config quotes the data directory" "$(cat "$S/omadbngin/servers/spc/redis.conf")" "dir \"$S/omadbngin/servers/spc/data\""
+
+pg_v=$(jq -r '.engines.postgresql["18"].version' "$here/engines.lock")
+L="$T/$(printf 'long-%.0s' {1..14})home"
+mkdir -p "$L/engines/postgresql/$pg_v/bin" "$T/xdg"
+printf '#!/bin/bash\nexit 0\n' >"$L/engines/postgresql/$pg_v/bin/initdb"
+chmod +x "$L/engines/postgresql/$pg_v/bin/initdb"
+HOME="$T/h lng" XDG_RUNTIME_DIR="$T/xdg" OMADBNGIN_HOME="$L" PATH="$T/ssbin:$PATH" "$DBCTL" create postgresql 18 lng 6391 off native >/dev/null 2>&1
+unitf="$T/h lng/.config/systemd/user/omadbngin-lng.service"
+has "a socket path that would be too long uses a short directory" "$(cat "$unitf" 2>&1)" "unix_socket_directories=$T/xdg/omadbngin-lng"
+has "which systemd creates" "$(cat "$unitf" 2>&1)" "RuntimeDirectory=omadbngin-lng"
+has "a short path keeps its own run directory" "$(cat "$S/.config/systemd/user/omadbngin-spc.service")" "ExecStart="
+if grep -q RuntimeDirectory "$S/.config/systemd/user/omadbngin-spc.service"; then bad "short path got a RuntimeDirectory"; else ok "and no RuntimeDirectory"; fi
+
 echo
 echo "$passed passed, $failed failed"
 ((failed == 0))
