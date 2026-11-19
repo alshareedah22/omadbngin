@@ -232,6 +232,8 @@ cp manifest.json Panel.qml DbState.qml Layout.js qmldir dbctl engines.lock icon.
 omarchy plugin enable blackcode.omadbngin --section right
 ```
 
+Also listed in the Omarchy plugin marketplace (https://plugins.omarchy.org): search for **OmaDBngin**.
+
 ## Updating
 
 Already using OmaDBngin? Update in place; your servers, their data and settings are kept.
@@ -318,3 +320,7 @@ running from `~/.local/share/omadbngin`; stop each native one with
 
 Passwords are stored for the panel and OmaTablePlus: in each server's `server.json` (mode 600)
 and, for Docker servers, as a container label that members of the `docker` group can read.
+
+## License
+
+MIT, see [LICENSE](LICENSE). The database engines OmaDBngin downloads or runs in Docker are separate projects under their own licenses.
