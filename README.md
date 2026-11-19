@@ -63,7 +63,7 @@ A DBngin-style database manager for the Omarchy bar. Click the 󰆼 icon to:
 - **See** its username and password (󰌆), **copy** its connection URL with them (󰆏), open its **CLI client** in a terminal (),
   follow its **logs** (󰦪)
 - Make it **start with the system** (󰐥)
-- **Open** it in [OmaTablePlus](https://github.com/alshareedah22/omatableplus) (, when OmaTablePlus is installed)
+- **Open** it in [OmaTablePlus](https://github.com/blackcodesh/omatableplus) (, when OmaTablePlus is installed)
 - **Delete** it and its data (󰆴, click twice)
 
 Each running server shows its uptime, memory and data size; a failed one shows the
@@ -210,7 +210,7 @@ This plugin used to be called OmaDB (`blackcode.omadb`). Install OmaDBngin, remo
 ## Install
 
 ```bash
-omarchy plugin add https://github.com/alshareedah22/omadbngin.git --enable
+omarchy plugin add https://github.com/blackcodesh/omadbngin.git --enable
 ```
 
 That is all: nothing to configure. The icon appears on the right of the bar, and on its first
