@@ -225,6 +225,16 @@ Panel {
   property string suggestedPort: ""
   property bool newAutostart: false
   property string newMode: defaultMode
+  // Set once you pick a mode yourself (or a Docker-only engine): then it is never changed for you.
+  property bool modeChosen: false
+  // Docker is not running (or not installed): a form that opens on "Docker container" can only
+  // fail, so open it on Native instead, unless you chose Docker on purpose.
+  function preferNativeWithoutDocker() {
+    if (root.stateLoaded && !root.dockerUp && !root.modeChosen && root.newMode === "docker") root.newMode = "native"
+  }
+  onStateLoadedChanged: preferNativeWithoutDocker()
+  onDockerUpChanged: preferNativeWithoutDocker()
+  onNewModeChanged: preferNativeWithoutDocker()
   function isInstalled(engine, line) {
     return root.installed.some(function(i) { return i.engine === engine && i.line === line })
   }
@@ -1191,6 +1201,7 @@ Panel {
               label: modelData.label
               selected: root.newMode === modelData.value
               onPicked: {
+                root.modeChosen = true
                 root.newMode = modelData.value
                 // Docker-only engines (PostGIS) cannot run natively.
                 if (modelData.value === "native" && root.newEngineInfo.dockerOnly) root.pickEngine("postgresql")
@@ -1211,7 +1222,7 @@ Panel {
               label: modelData.dockerOnly ? modelData.title + " 󰡨" : modelData.title
               selected: root.newEngine === modelData.id
               onPicked: {
-                if (modelData.dockerOnly) root.newMode = "docker"
+                if (modelData.dockerOnly) { root.modeChosen = true; root.newMode = "docker" }
                 root.pickEngine(modelData.id)
               }
             }

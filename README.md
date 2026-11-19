@@ -4,6 +4,12 @@
 
 **Compatibility:** works with Omarchy 4.5 (checked on 4.5.0-3: manifest validation, the plugin's own tests, and every Omarchy component, command and bar interface it uses).
 
+## What's new in 1.7.2
+
+- The new-server form opens on **Native engine** when Docker is not running or not installed
+  (it used to open on Docker container and show an error). If you pick Docker yourself, or a
+  Docker-only engine such as PostGIS, that choice is kept.
+
 ## What's new in 1.7.1
 
 Compatibility: works with Omarchy 4.5 (checked on 4.5.0-3).
