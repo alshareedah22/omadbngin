@@ -109,6 +109,7 @@ Panel {
   property string armedRestore: ""
   property string portDraft: ""       // kept here: a state refresh rebuilds the rows
   property bool portFocus: false
+  property bool showPass: false       // the new-server password is dots until asked for
   property bool omatable: false       // OmaTablePlus is installed: offer Open in OmaTablePlus
 
   function human(n) {
@@ -298,8 +299,41 @@ Panel {
       else askPort(root.newEngine)
     } else {
       root.shownLogs = ""
+      root.shownTools = ""
       root.page = "servers"
       root.search = ""
+      root.showPass = false
+      root.portDraft = ""
+      // Unfinished drafts, the password above all, do not outlive the panel. (The fields
+      // themselves are destroyed with it; this also empties what they were showing.)
+      nameField.text = ""
+      portField.text = ""
+      userField.text = ""
+      passField.text = ""
+    }
+  }
+
+  // ---- Paste ----
+  // The text fields never read the clipboard themselves (see SafeField.qml). A paste asks
+  // here: the clipboard's types are checked first, then at most 1 KiB of plain text is read,
+  // in a process that is killed after two seconds.
+  property var pasteTarget: null
+  function pasteInto(field, primary) {
+    if (pasteProc.running) return
+    const sel = primary ? "-p " : ""
+    root.pasteTarget = field
+    pasteProc.command = ["timeout", "-k", "1", "2", "sh", "-c",
+      "wl-paste " + sel + "--list-types 2>/dev/null | grep -q '^text/plain' && wl-paste " + sel + "--no-newline --type text/plain 2>/dev/null | head -c 1024"]
+    pasteProc.running = true
+  }
+  Process {
+    id: pasteProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        if (root.pasteTarget) root.pasteTarget.insertBounded(text)
+        root.pasteTarget = null
+      }
     }
   }
 
@@ -783,16 +817,18 @@ Panel {
             : "No servers yet. Create one below."
         }
 
-        TextField {
+        SafeField {
           id: searchField
+          live: root.opened && root.services.length > 5
           visible: root.services.length > 5
           width: parent.width
           foreground: root.fg
+          maximumLength: 100
           placeholderText: "Search name, engine, version, port or stack"
-          text: root.search
-          onTextEdited: root.search = text
-          Keys.onPressed: function(event) {
-            if (event.key === Qt.Key_Escape) { if (root.search) { root.search = ""; event.accepted = true } }
+          onTextChanged: root.search = text
+          onPasteRequested: function(primary) { root.pasteInto(searchField, primary) }
+          onKeyPressed: function(event) {
+            if (event.key === Qt.Key_Escape) { if (root.search) { searchField.text = ""; event.accepted = true } }
           }
         }
 
@@ -974,13 +1010,16 @@ Panel {
                         onPicked: row.modelData.engine === "mongodb" ? root.openInOmaTablePlus(row.modelData.name)
                           : root.run(row.modelData.name, "Backing up", ["backup", row.modelData.name], root.backupEnv)
                       }
-                      TextField {
+                      SafeField {
                         id: movePort
+                        live: root.opened
                         width: Style.space(70)
                         foreground: root.fg
+                        maximumLength: 5
                         placeholderText: String(row.modelData.port)
                         text: root.portDraft
-                        onTextEdited: root.portDraft = text
+                        onTextChanged: root.portDraft = text
+                        onPasteRequested: function(primary) { root.pasteInto(movePort, primary) }
                         onActiveFocusChanged: root.portFocus = activeFocus
                         onAccepted: moveChip.picked()
                       }
@@ -988,7 +1027,7 @@ Panel {
                         id: moveChip
                         label: "Move to port"
                         onPicked: {
-                          movePort.focus = false
+                          movePort.blur()
                           root.portFocus = false
                           if (root.portDraft) root.run(row.modelData.name, "Moving", ["set-port", row.modelData.name, root.portDraft])
                           root.portDraft = ""
@@ -1019,11 +1058,14 @@ Panel {
                     Label { text: "Stack: a project group, started and stopped together" }
                     Row {
                       spacing: Style.space(8)
-                      TextField {
+                      SafeField {
                         id: stackField
+                        live: root.opened
                         width: Style.space(160)
                         foreground: root.fg
+                        maximumLength: 31
                         placeholderText: row.modelData.stack || "none"
+                        onPasteRequested: function(primary) { root.pasteInto(stackField, primary) }
                         onActiveFocusChanged: root.portFocus = activeFocus
                         onAccepted: stackChip.picked()
                       }
@@ -1032,7 +1074,7 @@ Panel {
                         label: stackField.text.trim() ? "Put in " + stackField.text.trim() : (row.modelData.stack ? "Take out of " + row.modelData.stack : "Set")
                         onPicked: {
                           const st = stackField.text.trim()
-                          stackField.focus = false
+                          stackField.blur()
                           root.portFocus = false
                           if (st) root.run(row.modelData.name, "Saving", ["stack", "add", st, row.modelData.name])
                           else if (row.modelData.stack) root.run(row.modelData.name, "Saving", ["stack", "remove", row.modelData.name])
@@ -1252,12 +1294,15 @@ Panel {
             width: (parent.width - parent.spacing) * 0.62
             spacing: Style.space(4)
             Label { text: "Name" }
-            TextField {
+            SafeField {
               id: nameField
+              live: root.opened
               width: parent.width
               foreground: root.fg
+              maximumLength: 41
               placeholderText: root.defaultName
-              Keys.onPressed: function(event) {
+              onPasteRequested: function(primary) { root.pasteInto(nameField, primary) }
+              onKeyPressed: function(event) {
                 if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.createService(); event.accepted = true }
                 else if (event.key === Qt.Key_Escape) { root.close(); event.accepted = true }
               }
@@ -1268,12 +1313,15 @@ Panel {
             width: (parent.width - parent.spacing) * 0.38
             spacing: Style.space(4)
             Label { text: "Port" }
-            TextField {
+            SafeField {
               id: portField
+              live: root.opened
               width: parent.width
               foreground: root.fg
+              maximumLength: 5
               placeholderText: root.suggestedPort || "auto"
-              Keys.onPressed: function(event) {
+              onPasteRequested: function(primary) { root.pasteInto(portField, primary) }
+              onKeyPressed: function(event) {
                 if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.createService(); event.accepted = true }
                 else if (event.key === Qt.Key_Escape) { root.close(); event.accepted = true }
               }
@@ -1289,12 +1337,15 @@ Panel {
             width: (parent.width - parent.spacing) / 2
             spacing: Style.space(4)
             Label { text: "Username" }
-            TextField {
+            SafeField {
               id: userField
+              live: root.opened
               width: parent.width
               foreground: root.fg
+              maximumLength: 32
               placeholderText: root.defaultUser || "none (no auth)"
-              Keys.onPressed: function(event) {
+              onPasteRequested: function(primary) { root.pasteInto(userField, primary) }
+              onKeyPressed: function(event) {
                 if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.createService(); event.accepted = true }
                 else if (event.key === Qt.Key_Escape) { root.close(); event.accepted = true }
               }
@@ -1304,13 +1355,24 @@ Panel {
           Column {
             width: (parent.width - parent.spacing) / 2
             spacing: Style.space(4)
-            Label { text: "Password" }
-            TextField {
+            Row {
+              spacing: Style.space(8)
+              Label { text: "Password"; anchors.verticalCenter: parent.verticalCenter }
+              Chip {
+                label: root.showPass ? "Hide" : "Show"
+                onPicked: root.showPass = !root.showPass
+              }
+            }
+            SafeField {
               id: passField
+              live: root.opened
               width: parent.width
               foreground: root.fg
+              secret: !root.showPass
+              maximumLength: 64
               placeholderText: "none"
-              Keys.onPressed: function(event) {
+              onPasteRequested: function(primary) { root.pasteInto(passField, primary) }
+              onKeyPressed: function(event) {
                 if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) { root.createService(); event.accepted = true }
                 else if (event.key === Qt.Key_Escape) { root.close(); event.accepted = true }
               }
@@ -1521,12 +1583,15 @@ Panel {
               font.family: root.fontFamily
               font.pixelSize: Style.font.bodySmall
             }
-            TextField {
+            SafeField {
               id: defUser
+              live: root.opened && root.page === "settings"
               anchors.right: defPort.left
               anchors.rightMargin: Style.space(6)
               width: Style.space(120)
               foreground: root.fg
+              maximumLength: 32
+              onPasteRequested: function(primary) { root.pasteInto(defUser, primary) }
               visible: parent.modelData.id !== "mongodb"
               placeholderText: String(root.userDefaults[parent.modelData.id] || ({ postgresql: "postgres", postgis: "postgres", mysql: "root", mariadb: "root", redis: "default", valkey: "default" })[parent.modelData.id] || "user")
               onAccepted: {
@@ -1537,11 +1602,14 @@ Panel {
                 text = ""
               }
             }
-            TextField {
+            SafeField {
               id: defPort
+              live: root.opened && root.page === "settings"
               anchors.right: parent.right
               width: Style.space(80)
               foreground: root.fg
+              maximumLength: 5
+              onPasteRequested: function(primary) { root.pasteInto(defPort, primary) }
               placeholderText: String(root.portDefaults[parent.modelData.id] || parent.modelData.port)
               validator: IntValidator { bottom: 1024; top: 65535 }
               onAccepted: {
@@ -1556,10 +1624,14 @@ Panel {
         }
         SettingRow {
           title: "Backup folder"
-          TextField {
+          SafeField {
+            id: backupField
+            live: root.opened && root.page === "settings"
             width: Style.space(220)
             foreground: root.fg
+            maximumLength: 256
             placeholderText: root.backupLabel
+            onPasteRequested: function(primary) { root.pasteInto(backupField, primary) }
             onAccepted: { root.saveSettings({ backupDir: text.trim() || null }); text = "" }
           }
         }

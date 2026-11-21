@@ -547,11 +547,13 @@ create_native() {
   base=$(ensure_engine "$engine" "$version")
   exact=${base##*/}
   dir=$(server_dir "$name")
-  [[ -e $dir ]] && fail "$dir already exists"
+  mkdir -p "$SERVERS_DIR"
+  # mkdir is the claim: it fails for a directory somebody else made, which is then left alone
+  mkdir "$dir" 2>/dev/null || fail "$dir already exists"
+  journal dir "$dir"
   mkdir -p "$dir/data" "$dir/run"
   chmod 700 "$dir"
   if ! native_init "$engine" "$base" "$dir/data" "$user" "$pass"; then
-    rm -rf "$dir"
     fail "initializing $engine $exact failed"
   fi
   if [[ $engine == redis || $engine == valkey ]]; then
@@ -574,6 +576,8 @@ create_native() {
   mysql | mariadb) [[ $user == root && -z $pass ]] || provision_mysql "$engine" "$base" "$dir" "$user" "$pass" ;;
   mongodb) [[ -z $user ]] || { provision_mongodb "$base" "$dir" "$port" "$user" "$pass"; auth=auth; } ;;
   esac
+  [[ ! -e $UNIT_DIR/$(unit "$name") ]] || fail "a service for $name already exists"
+  journal unit "$(unit "$name")"
   write_unit "$name" "$engine" "$exact" "$(with_compat "$base" "$(native_exec "$engine" "$base" "$dir" "$port" $auth)")"
   systemctl --user start "$(unit "$name")"
   [[ $autostart == on ]] && systemctl --user enable --quiet "$(unit "$name")"
@@ -685,7 +689,7 @@ create_docker() {
   esac
 
   docker_run "$name" "$engine" "$version" "$port" "$autostart" "$user" "$pass" "$image" "$inner" "$data" "${#env[@]}" \
-    "${env[@]}" "${cmd[@]}"
+    "${env[@]}" "${cmd[@]}" || exit 1
 
   if [[ $engine == mysql || $engine == mariadb ]] && ! [[ $user == root && -z $pass ]]; then
     echo "Setting up user $user…" >&2
@@ -694,12 +698,20 @@ create_docker() {
   fi
 }
 
+# ensure_volume <name>: create the volume unless it exists; one this attempt creates carries the
+# attempt's token label and goes in the journal, so a failed create removes it and only it.
+ensure_volume() {
+  docker volume inspect "$1" >/dev/null 2>&1 && return 0
+  docker volume create ${CREATE_TOKEN:+--label "omadbngin.create=$CREATE_TOKEN"} "$1" >/dev/null || fail "creating the volume $1 failed"
+  journal volume "$1"
+}
+
 # Docker Redis/Valkey: the auth settings live in /data/omadbngin.conf on the server's volume
 # (written through stdin), so they are not in the container's command line, which every
 # local account sees in ps.
 redis_volume_conf() {
   local name=$1 image=$2 user=$3 pass=$4
-  docker volume create "$(container "$name")" >/dev/null
+  ensure_volume "$(container "$name")"
   redis_auth_conf "$user" "$pass" |
     docker run --rm -i -v "$(container "$name"):/data" --entrypoint sh "$image" -c \
       'cat >/data/omadbngin.conf && chmod 600 /data/omadbngin.conf && chown "$(stat -c %u:%g /data)" /data/omadbngin.conf' ||
@@ -722,9 +734,13 @@ docker_run() {
   : >"$tmp/env"
   for ((i = 0; i < ${#env[@]}; i++)); do [[ ${env[i]} == -e ]] || printf '%s\n' "${env[i]}" >>"$tmp/env"; done
 
+  docker inspect "$(container "$name")" >/dev/null 2>&1 && fail "a container named $(container "$name") already exists"
+  ensure_volume "$(container "$name")"
+  journal container "$(container "$name")"
   docker run -d --quiet \
     --name "$(container "$name")" \
     --label "$LABEL" \
+    ${CREATE_TOKEN:+--label "omadbngin.create=$CREATE_TOKEN"} \
     --label "omadbngin.name=$name" \
     --label "omadbngin.engine=$engine" \
     --label "omadbngin.version=$version" \
@@ -784,7 +800,9 @@ migrate_native() {
     [[ -f $dir/$engine.conf ]] && sed -i "s#$LEGACY_HOME/#$HOME_DIR/#g" "$dir/$engine.conf"
     auth=()
     [[ $engine == mongodb && -n $user ]] && auth=(auth)
-    write_unit "$name" "$engine" "$exact" "$(with_compat "$base" "$(native_exec "$engine" "$base" "$dir" "$port" "${auth[@]}")")"
+    [[ ! -e $UNIT_DIR/$(unit "$name") ]] || fail "a service for $name already exists"
+  journal unit "$(unit "$name")"
+  write_unit "$name" "$engine" "$exact" "$(with_compat "$base" "$(native_exec "$engine" "$base" "$dir" "$port" "${auth[@]}")")"
     [[ " ${enabled[*]} " == *" $name "* ]] && systemctl --user enable --quiet "$(unit "$name")"
     [[ " ${running[*]} " == *" $name "* ]] && systemctl --user start "$(unit "$name")"
   done
@@ -1246,18 +1264,55 @@ cmd_create() {
   [[ $pass =~ ^[^[:space:]\'\"\`\\\$]*$ ]] || fail "password: no spaces, quotes, backslashes or \$"
   ((${#pass} <= 64)) || fail "password: up to 64 characters"
   [[ $engine == mongodb && -n $user && -z $pass ]] && fail "MongoDB needs a password for user $user"
+  # One create per name at a time: a parallel `dbctl create` (or a second panel) waits here, then
+  # finds the name taken and stops, instead of racing the first one's provisioning.
+  mkdir -p "$HOME_DIR/tmp"
+  exec 7>"$HOME_DIR/tmp/create-$name.lock"
+  flock 7
   [[ -z $port ]] && port=$(next_port "$engine")
   [[ $port =~ ^[0-9]+$ ]] && ((port >= 1024 && port <= 65535)) || fail "port must be 1024–65535"
   [[ -z $(mode_of "$name") ]] || fail "a server named $name already exists"
   port_taken "$port" && fail "port $port is already in use"
-  # The name was free a moment ago, so on failure everything under it is ours to undo.
+  # Everything this attempt creates is written to a journal as it is created; if the attempt
+  # fails, exactly those resources are undone and nothing else (see rollback_create).
+  CREATE_TOKEN="$$-$RANDOM-$(date +%s%N)"
+  CREATE_JOURNAL=$(mktemp "$HOME_DIR/tmp/create-journal.XXXXXX")
   if ! ("create_$mode" "$engine" "$version" "$name" "$port" "$autostart" "$user" "$pass"); then
-    if [[ -n $(mode_of "$name") || -e $(server_dir "$name") ]]; then
-      MODE=$(mode_of "$name")
-      if [[ -z $MODE ]]; then rm -rf "$(server_dir "$name")"; else cmd_remove "$name" >/dev/null 2>&1; fi
-    fi
+    rollback_create
+    rm -f "$CREATE_JOURNAL"
     exit 1
   fi
+  rm -f "$CREATE_JOURNAL"
+}
+
+# journal <kind> <value>: note a resource this create attempt just made (or is about to make)
+journal() {
+  [[ -n ${CREATE_JOURNAL:-} ]] && printf '%s\t%s\n' "$1" "$2" >>"$CREATE_JOURNAL"
+  return 0
+}
+
+# Undo what the failed attempt made, newest first. A server directory or unit counts only if
+# the attempt created it (it claims them with mkdir and an absence check, under the name's
+# lock); a container or volume only if it carries this attempt's token label.
+rollback_create() {
+  local kind val
+  [[ -s ${CREATE_JOURNAL:-} ]] || return 0
+  while IFS=$'\t' read -r kind val; do
+    case $kind in
+    unit)
+      systemctl --user disable --now --quiet "$val" 2>/dev/null || true
+      rm -f "$UNIT_DIR/$val"
+      systemctl --user daemon-reload 2>/dev/null || true ;;
+    dir) rm -rf "$val" ;;
+    container)
+      [[ $(docker inspect -f '{{index .Config.Labels "omadbngin.create"}}' "$val" 2>/dev/null) == "$CREATE_TOKEN" ]] &&
+        docker rm -f "$val" >/dev/null 2>&1 ;;
+    volume)
+      [[ $(docker volume inspect -f '{{index .Labels "omadbngin.create"}}' "$val" 2>/dev/null) == "$CREATE_TOKEN" ]] &&
+        docker volume rm "$val" >/dev/null 2>&1 ;;
+    esac
+  done < <(tac "$CREATE_JOURNAL")
+  return 0
 }
 
 cmd_power() {
@@ -1451,7 +1506,35 @@ cmd_backup() {
   echo "$file"
 }
 
-# restore_psql <file> <psql command…>: feed a dump to psql. A pg_dumpall dump starts with
+# check_sql_dump <file>: a private copy of a SQL dump that is safe to feed to psql, in SAFE_DUMP.
+# psql would run any "\!" or "\o" line of the file under this account, so the dump is checked
+# first (tools/check-sql-dump.py follows psql's own lexing) and psql reads the checked copy,
+# not the original, which could change in between.
+check_sql_dump() {
+  local file=$1 checker
+  checker="$(dirname "$(readlink -f "$0")")/tools/check-sql-dump.py"
+  [[ -f $checker ]] || fail "tools/check-sql-dump.py is missing; reinstall the plugin"
+  command -v python3 >/dev/null || fail "python3 is needed to check a dump before restoring it"
+  RESTORE_TMP=$(private_tmp)
+  trap 'rm -rf "$RESTORE_TMP"' EXIT
+  SAFE_DUMP=$RESTORE_TMP/dump.sql
+  install -m 600 "$file" "$SAFE_DUMP" || fail "cannot read $file"
+  python3 -I "$checker" "$SAFE_DUMP" ||
+    fail "$file was not restored: it holds commands for the psql client (shown above), not only SQL. Review it, or run it with psql yourself"
+}
+
+# clean_env <command…>: run a command with only the environment it needs (the engine's own
+# libraries, the password psql reads, the locale), no config files or hooks of this account.
+clean_env() {
+  local v
+  for v in $(compgen -e); do
+    case $v in PATH | LD_LIBRARY_PATH | PGPASSWORD | LANG | LC_*) ;; *) unset "$v" 2>/dev/null || true ;; esac
+  done
+  export HOME=$RESTORE_TMP PSQLRC=/dev/null PSQL_HISTORY=/dev/null
+  exec "$@"
+}
+
+# restore_psql <file> <psql command…>: feed a checked dump to psql. A pg_dumpall dump starts with
 # CREATE ROLE postgres and the like, which "already exist" on any server, so ON_ERROR_STOP
 # would stop at line 1: psql runs on, and every other error is collected and fails the restore
 # (psql itself exits 0 whatever failed in the script).
@@ -1467,9 +1550,158 @@ restore_psql() {
   return "$rc"
 }
 
+# rdb_wait_ready <seconds×10> <redis-cli command…>: until the server answers and has loaded its data
+rdb_wait_ready() {
+  local tries=$1 i pong info
+  shift
+  for ((i = 0; i < tries; i++)); do
+    pong=$("$@" ping 2>/dev/null) || pong=""
+    if [[ $pong == PONG ]]; then
+      info=$("$@" info persistence 2>/dev/null) || info=""
+      [[ $info == *loading:0* ]] && return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# rdb_check_native <engine> <base> <file>: load the snapshot in a throwaway server of its own
+# (no network, an empty directory) to learn whether the engine accepts it. Nothing of the
+# real server is touched.
+rdb_check_native() {
+  local engine=$1 base=$2 file=$3 d rc=1
+  d=$(private_tmp) || return 1
+  install -m 600 "$file" "$d/dump.rdb"
+  if "$base/bin/$engine-server" --dir "$d" --port 0 --unixsocket "$d/s" --appendonly no --save "" \
+    --daemonize yes --pidfile "$d/pid" --logfile "$d/log" >/dev/null 2>&1; then
+    rdb_wait_ready 100 "$base/bin/$engine-cli" -s "$d/s" && rc=0
+    "$base/bin/$engine-cli" -s "$d/s" shutdown nosave >/dev/null 2>&1 || true
+    local i
+    for i in $(seq 50); do [[ -e $d/s ]] || break; sleep 0.1; done
+    [[ -s $d/pid && -e $d/s ]] && kill "$(cat "$d/pid")" 2>/dev/null
+  fi
+  rm -rf "$d"
+  return $rc
+}
+
+# The data files a restore replaces are moved aside, not deleted, until the restored server
+# is healthy.
+rdb_move_aside_native() { # <data dir> <keep dir>
+  local f
+  mkdir -p "$2/data"
+  for f in "$1"/dump.rdb "$1"/appendonlydir "$1"/appendonly*.aof; do [[ -e $f ]] && mv "$f" "$2/data/"; done
+  return 0
+}
+
+rdb_put_back_native() { # <data dir> <keep dir> <conf>
+  local f
+  rm -rf "$1/dump.rdb" "$1/appendonlydir" "$1"/appendonly*.aof
+  for f in "$2"/data/*; do [[ -e $f ]] && mv "$f" "$1/"; done
+  [[ -f $2/conf ]] && cp -p "$2/conf" "$3"
+  return 0
+}
+
+# restore_rdb_native <name> <engine> <file>
+restore_rdb_native() {
+  local name=$1 engine=$2 file=$3 dir conf keep base aof="" cli
+  base=$(engine_base "$name")
+  rdb_check_native "$engine" "$base" "$file" ||
+    fail "$file is not a snapshot $engine can load; $name was not changed"
+  dir=$(server_dir "$name")/data
+  conf=$(server_dir "$name")/$engine.conf
+  keep=$dir/.pre-restore-$(date +%Y%m%d-%H%M%S)-$$
+  cli=("$base/bin/$engine-cli" -p "$(field_of "$name" port)")
+  [[ -n $PASS_ ]] && { cli+=(--user "$USER_" --no-auth-warning); export REDISCLI_AUTH=$PASS_; }
+  grep -q '^appendonly yes' "$conf" && aof=1
+  systemctl --user stop "$(unit "$name")"
+  # The old data stays in $keep until the restored server answers; any failure puts it back.
+  rdb_move_aside_native "$dir" "$keep"
+  cp -p "$conf" "$keep/conf"
+  install -m 600 "$file" "$dir/dump.rdb"
+  # With its append-only log on, the server would ignore the snapshot: start once with the
+  # log off so it loads the snapshot, then turn the log back on (it is rebuilt from the data).
+  [[ -n $aof ]] && sed -i 's/^appendonly yes/appendonly no/' "$conf"
+  systemctl --user start "$(unit "$name")" || true
+  if ! rdb_wait_ready "${OMADBNGIN_HEALTH_TRIES:-300}" "${cli[@]}"; then
+    systemctl --user stop "$(unit "$name")" || true
+    rdb_put_back_native "$dir" "$keep" "$conf"
+    systemctl --user start "$(unit "$name")" || true
+    rm -rf "$keep"
+    fail "restore into $name failed: the restored server did not come up; its previous data is back"
+  fi
+  if [[ -n $aof ]]; then
+    sed -i 's/^appendonly no/appendonly yes/' "$conf"
+    "${cli[@]}" config set appendonly yes >/dev/null ||
+      fail "restored, but turning the append-only log back on failed; the previous data is kept in $keep"
+  fi
+  rm -rf "$keep"
+}
+
+# restore_rdb_docker <name> <engine> <file>
+restore_rdb_docker() {
+  local name=$1 engine=$2 file=$3 c image keep health
+  c=$(container "$name")
+  image=$(image_of "$c") || fail "cannot read the image of $c"
+  # First on its own: does the engine accept this snapshot? (a throwaway container, no volume)
+  docker run --rm -v "$file:/in.rdb:ro" --entrypoint sh "$image" -c '
+    set -e
+    d=$(mktemp -d)
+    cp /in.rdb "$d/dump.rdb"
+    '"$engine"'-server --dir "$d" --port 0 --unixsocket "$d/s" --appendonly no --save "" --daemonize yes >/dev/null
+    i=0; until '"$engine"'-cli -s "$d/s" ping >/dev/null 2>&1 && '"$engine"'-cli -s "$d/s" info persistence | grep -q "^loading:0"; do
+      i=$((i + 1)); [ $i -lt 100 ] || exit 1; sleep 0.1
+    done
+    '"$engine"'-cli -s "$d/s" shutdown nosave >/dev/null 2>&1 || true' >/dev/null 2>&1 ||
+    fail "$file is not a snapshot $engine can load; $name was not changed"
+  keep=.pre-restore-$(date +%Y%m%d-%H%M%S)-$$
+  health=("$engine-cli" ${PASS_:+--user "$USER_"} --no-auth-warning)
+  docker stop "$c" >/dev/null
+  # The container runs with the append-only log on, so it would ignore a snapshot: load it in a
+  # throwaway server on the same volume with the log off, turn the log on so it is rebuilt from
+  # the data, and hand the files back to the image's user. The old files wait in $keep.
+  if ! docker run --rm --volumes-from "$c" -e "KEEP=$keep" -v "$file:/omadbngin-restore.rdb:ro" --entrypoint sh "$image" -c '
+      set -e
+      cd /data
+      mkdir "$KEEP"
+      for f in dump.rdb appendonlydir appendonly*.aof; do [ -e "$f" ] && mv "$f" "$KEEP/"; done
+      cp /omadbngin-restore.rdb dump.rdb
+      '"$engine"'-server --dir /data --port 0 --unixsocket /tmp/s --appendonly no --daemonize yes >/dev/null
+      cli() { '"$engine"'-cli -s /tmp/s "$@"; }
+      i=0; until cli ping >/dev/null 2>&1; do i=$((i + 1)); [ $i -lt 100 ] || exit 1; sleep 0.1; done
+      cli config set appendonly yes >/dev/null
+      i=0; until cli info persistence | grep -q "^aof_rewrite_in_progress:0" && cli info persistence | grep -q "^aof_rewrite_scheduled:0" &&
+        cli info persistence | grep -q "^aof_enabled:1"; do i=$((i + 1)); [ $i -lt 300 ] || exit 1; sleep 0.1; done
+      cli shutdown >/dev/null 2>&1 || true
+      while [ -e /tmp/s ]; do sleep 0.1; done
+      chown -R "$(stat -c %u:%g /data)" /data' >/dev/null; then
+    rdb_put_back_docker "$c" "$image" "$keep"
+    docker start "$c" >/dev/null
+    fail "restore into $name failed; its previous data is back"
+  fi
+  docker start "$c" >/dev/null
+  # Only a restored server that answers lets the old files go.
+  if ! REDISCLI_AUTH=$PASS_ rdb_wait_ready "${OMADBNGIN_HEALTH_TRIES:-300}" docker exec -e REDISCLI_AUTH "$c" "${health[@]}"; then
+    docker stop "$c" >/dev/null 2>&1 || true
+    rdb_put_back_docker "$c" "$image" "$keep"
+    docker start "$c" >/dev/null
+    fail "restore into $name failed: the restored server did not come up; its previous data is back"
+  fi
+  docker exec -u 0 "$c" rm -rf "/data/$keep" >/dev/null 2>&1 || true
+}
+
+# rdb_put_back_docker <container> <image> <keep dir>: the old files back into the stopped container's volume
+rdb_put_back_docker() {
+  docker run --rm --volumes-from "$1" -e "KEEP=$3" --entrypoint sh "$2" -c '
+    cd /data
+    [ -d "$KEEP" ] || exit 0
+    rm -rf dump.rdb appendonlydir appendonly*.aof
+    for f in "$KEEP"/*; do [ -e "$f" ] && mv "$f" .; done
+    rm -rf "$KEEP"' >/dev/null 2>&1 || true
+}
+
 # restore <name> <file>: SQL runs against the server; an RDB replaces the Redis/Valkey data
 cmd_restore() {
-  local name=${1:-} file=${2:-} engine port base c dir
+  local name=${1:-} file=${2:-} engine port base c
   require_managed "$name"
   [[ -f $file ]] || fail "no file at $file"
   engine=$(kind_of "$(field_of "$name" engine)")
@@ -1480,63 +1712,24 @@ cmd_restore() {
   mongodb) fail "MongoDB restores: open the server in OmaTablePlus and use Database ▾ → Restore" ;;
   redis | valkey)
     [[ $(head -c 5 "$file") == REDIS ]] || fail "$file is not an RDB snapshot"
-    if [[ $MODE == native ]]; then
-      dir=$(server_dir "$name")/data
-      systemctl --user stop "$(unit "$name")"
-      install -m 600 "$file" "$dir/dump.rdb"
-      # With its append-only log on, the server would ignore the snapshot: start once with the
-      # log off so it loads the snapshot, then turn the log back on (it is rebuilt from the data).
-      local conf cli aof=""
-      conf=$(server_dir "$name")/$engine.conf
-      cli=("$(engine_base "$name")/bin/$engine-cli" -p "$port")
-      [[ -n $PASS_ ]] && { cli+=(--user "$USER_" --no-auth-warning); export REDISCLI_AUTH=$PASS_; }
-      grep -q '^appendonly yes' "$conf" && aof=1
-      rm -rf "$dir/appendonlydir" "$dir"/appendonly*.aof
-      [[ -n $aof ]] && sed -i 's/^appendonly yes/appendonly no/' "$conf"
-      systemctl --user start "$(unit "$name")"
-      if [[ -n $aof ]]; then
-        for _ in $(seq 50); do "${cli[@]}" ping >/dev/null 2>&1 && break; sleep 0.2; done
-        sed -i 's/^appendonly no/appendonly yes/' "$conf"
-        "${cli[@]}" config set appendonly yes >/dev/null || fail "restored, but turning the append-only log back on failed"
-      fi
-    else
-      # The container runs with the append-only log on, so it would ignore a snapshot: load it
-      # in a throwaway server on the same volume with the log off, turn the log on so it is
-      # rebuilt from the data, and hand the files back to the image's user.
-      local image
-      image=$(image_of "$c")
-      docker stop "$c" >/dev/null
-      docker run --rm --volumes-from "$c" -v "$file:/omadbngin-restore.rdb:ro" --entrypoint sh "$image" -c '
-        set -e
-        cd /data
-        rm -rf appendonlydir appendonly*.aof
-        cp /omadbngin-restore.rdb dump.rdb
-        '"$engine"'-server --dir /data --port 0 --unixsocket /tmp/s --appendonly no --daemonize yes >/dev/null
-        cli() { '"$engine"'-cli -s /tmp/s "$@"; }
-        i=0; until cli ping >/dev/null 2>&1; do i=$((i + 1)); [ $i -lt 100 ] || exit 1; sleep 0.1; done
-        cli config set appendonly yes >/dev/null
-        i=0; until cli info persistence | grep -q "^aof_rewrite_in_progress:0" && cli info persistence | grep -q "^aof_rewrite_scheduled:0" &&
-          cli info persistence | grep -q "^aof_enabled:1"; do i=$((i + 1)); [ $i -lt 300 ] || exit 1; sleep 0.1; done
-        cli shutdown >/dev/null 2>&1 || true
-        while [ -e /tmp/s ]; do sleep 0.1; done
-        chown -R "$(stat -c %u:%g /data)" /data' || { docker start "$c" >/dev/null; fail "restore into $name failed"; }
-      docker start "$c" >/dev/null
-    fi
+    if [[ $MODE == native ]]; then restore_rdb_native "$name" "$engine" "$file"; else restore_rdb_docker "$name" "$engine" "$file"; fi
     return ;;
+  postgresql) check_sql_dump "$file" ;;
   esac
   if [[ $MODE == native ]]; then
     base=$(engine_base "$name")
     # MySQL's clients need the engine's compat libraries (libncurses) too
     if [[ -d $base/compat ]]; then export LD_LIBRARY_PATH=$base/compat; fi
     case $engine in
-    postgresql) PGPASSWORD="$PASS_" restore_psql "$file" "$base/bin/psql" -X -q -h 127.0.0.1 -p "$port" -U "$USER_" -d postgres ;;
-    mysql) MYSQL_PWD="$PASS_" "$base/bin/mysql" -h127.0.0.1 -P"$port" -u"$USER_" <"$file" ;;
-    mariadb) MYSQL_PWD="$PASS_" "$base/bin/mariadb" -h127.0.0.1 -P"$port" -u"$USER_" --skip-ssl <"$file" ;;
+    postgresql) PGPASSWORD="$PASS_" restore_psql "$SAFE_DUMP" clean_env "$base/bin/psql" -X -q -w -h 127.0.0.1 -p "$port" -U "$USER_" -d postgres ;;
+    # --binary-mode: the mysql client then runs no "\!", "system" or "source" commands from the file
+    mysql) MYSQL_PWD="$PASS_" "$base/bin/mysql" --binary-mode -h127.0.0.1 -P"$port" -u"$USER_" <"$file" ;;
+    mariadb) MYSQL_PWD="$PASS_" "$base/bin/mariadb" --binary-mode -h127.0.0.1 -P"$port" -u"$USER_" --skip-ssl <"$file" ;;
     esac
   else
     case $engine in
-    postgresql) PGPASSWORD=$PASS_ restore_psql "$file" docker exec -i -e PGPASSWORD "$c" psql -X -q -U "$USER_" -d postgres ;;
-    mysql | mariadb) MYSQL_PWD=$PASS_ docker exec -i -e MYSQL_PWD "$c" "$engine" -u"$USER_" <"$file" ;;
+    postgresql) PGPASSWORD=$PASS_ restore_psql "$SAFE_DUMP" docker exec -i -e PGPASSWORD "$c" psql -X -q -w -U "$USER_" -d postgres ;;
+    mysql | mariadb) MYSQL_PWD=$PASS_ docker exec -i -e MYSQL_PWD "$c" "$engine" --binary-mode -u"$USER_" <"$file" ;;
     esac
   fi || fail "restore into $name failed"
 }

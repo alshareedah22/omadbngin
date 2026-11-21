@@ -4,6 +4,26 @@
 
 **Compatibility:** works with Omarchy 4.5 (checked on 4.5.0-3: manifest validation, the plugin's own tests, and every Omarchy component, command and bar interface it uses).
 
+## What's new in 1.7.3
+
+- **Safer PostgreSQL restores**: a dump is checked before `psql` reads it. A line that would run a
+  `psql` client command on your account (`\!`, `\o`, `\i` and the like) makes the restore stop with an
+  error, so only plain SQL (and the `\connect` and `COPY` lines `pg_dumpall` writes) gets through.
+  `psql` runs with no rc, history or password prompts and only the environment it needs. MySQL and
+  MariaDB restores run the client in binary mode, which turns its `\!` and `system` commands off.
+- **Redis/Valkey restores keep your old data until the new data works**: the snapshot is first loaded
+  in a throwaway server, and the current snapshot and append-only log are only set aside. If the
+  restored server does not come up, the old data and settings are put back (native and Docker).
+- **Creating a server is one at a time per name**, and a failed create removes only what that
+  attempt made, never a folder, service, container or volume somebody else created meanwhile.
+  A failing `docker run` now fails the create instead of reporting success.
+- **Text fields exist only while the panel is open**: Qt text inputs watch the Wayland clipboard
+  for as long as they live, and a slow clipboard owner could stall the shell. A paste (Ctrl+V,
+  Shift+Insert, middle click) now reads at most 1 KiB of plain text in a separate process that is
+  stopped after two seconds, and every field has a length limit.
+- **The new-server password is masked** (use Show to see it), and unfinished drafts are cleared
+  when the panel closes.
+
 ## What's new in 1.7.2
 
 - The new-server form opens on **Native engine** when Docker is not running or not installed
@@ -71,8 +91,9 @@ last error from its log. The  button opens its tools:
 
 - **Back up** every database to `~/Downloads/<name>-<date>.sql` (Redis/Valkey: an
   `.rdb` snapshot). MongoDB backups are made in OmaTablePlus (*Database ▾ → Back up*).
-- **Restore** one of the listed backups (click twice). SQL dumps run against the server;
-  an RDB snapshot replaces the Redis/Valkey data.
+- **Restore** one of the listed backups (click twice). SQL dumps run against the server (after a
+  check that they hold no commands for the client); an RDB snapshot replaces the Redis/Valkey data,
+  and the old data comes back if the new data does not start.
 - **Move to port**: the server gets a new port and restarts if it was running (Docker
   servers are recreated on the same volume, so the data stays).
 
@@ -191,7 +212,7 @@ on any shared machine, or when other people or untrusted software run on it.
 
 - x86_64 Linux only (`engines.lock` pins x86_64 builds and images)
 - Omarchy 4 (the Quickshell-based `omarchy-shell` bar)
-- `curl`, `jq`, `ss`, `wl-copy`, `make` and `gcc`, which ship with Omarchy (Redis publishes no Linux binaries, so
+- `curl`, `jq`, `ss`, `wl-copy`, `wl-paste`, `python3`, `make` and `gcc`, which ship with Omarchy (Redis publishes no Linux binaries, so
   Redis is built from source on first use and needs both; if the build fails, its log path is printed)
 - For Docker mode only: Docker, running, with your user in the `docker` group
   (`omarchy install docker`)
@@ -278,7 +299,7 @@ folder setting), otherwise `~/Downloads`.
 tests/test-dbctl.sh                 # every engine, native and Docker (~15 min)
 tests/test-dbctl.sh native redis    # one mode, chosen engines
 tests/test-migration.sh             # moving native and Docker servers over from OmaDB
-tests/test-fast.sh                  # connection formats, stacks, state, shortcut (seconds, no Docker)
+tests/test-fast.sh                  # formats, stacks, state, restores, creation races, panel fields (seconds, fakes only)
 node --test tests/js/               # bar position and settings writes
 tools/measure-load 60               # the shell's CPU and memory, panel closed or open
 ```
